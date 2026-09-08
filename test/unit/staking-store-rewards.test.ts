@@ -1,7 +1,7 @@
 import { beforeEach, describe, expect, it, vi } from 'vitest'
 import { mockNuxtImport } from '@nuxt/test-utils/runtime'
 import { createPinia, setActivePinia } from 'pinia'
-import { ref } from 'vue'
+import { nextTick, ref } from 'vue'
 
 import { useStakingStore } from '~/stores/staking'
 
@@ -18,7 +18,8 @@ const {
 }))
 
 mockNuxtImport('fetchCollectiveAccountStakings', () => mockFetchCollectiveAccountStakings)
-mockNuxtImport('useUserSession', () => () => ({ loggedIn: ref(true) }))
+const hasLoggedIn = ref(true)
+mockNuxtImport('useUserSession', () => () => ({ loggedIn: hasLoggedIn }))
 mockNuxtImport('useLikeCollectiveContract', () => () => ({
   getWalletPendingRewardsOfNFTClass: mockGetWalletPendingRewardsOfNFTClass,
   getWalletStakeOfNFTClass: mockGetWalletStakeOfNFTClass,
@@ -58,6 +59,7 @@ describe('staking store rewards', () => {
   let store: ReturnType<typeof useStakingStore>
 
   beforeEach(() => {
+    hasLoggedIn.value = true
     setActivePinia(createPinia())
     store = useStakingStore()
     mockFetchCollectiveAccountStakings.mockReset()
@@ -137,6 +139,82 @@ describe('staking store rewards', () => {
     expect(items).toHaveLength(1)
     expect(items[0]?.nftClassId).toBe(LOWERCASE)
     expect(totalUnclaimedRewards).toBe(500n)
+  })
+
+  it('shares one walk between overlapping callers', async () => {
+    let resolvePage: (value: unknown) => void = () => {}
+    mockFetchCollectiveAccountStakings.mockReturnValueOnce(
+      new Promise((resolve) => { resolvePage = resolve }),
+    )
+
+    // The shelf load and a post-claim refresh can land in the same tick.
+    const first = store.fetchUserStakingData(WALLET)
+    const second = store.fetchUserStakingData(WALLET)
+
+    let hasSecondSettled = false
+    void second.then(() => {
+      hasSecondSettled = true
+    })
+    for (let tick = 0; tick < 5; tick += 1) {
+      await Promise.resolve()
+    }
+
+    // The joining caller must wait for the walk. It used to get `undefined`
+    // back and settle within a tick, reporting done on a fetch still paging.
+    expect(hasSecondSettled).toBe(false)
+
+    resolvePage(makeStakingsResponse([{ bookNFT: CHECKSUMMED, staked: '1000', pending: '500' }]))
+    await Promise.all([first, second])
+
+    expect(hasSecondSettled).toBe(true)
+    expect(mockFetchCollectiveAccountStakings).toHaveBeenCalledTimes(1)
+    expect(store.getUserStakingData(WALLET).totalUnclaimedRewards).toBe(500n)
+  })
+
+  it('fetches again once the previous walk has settled', async () => {
+    mockFetchCollectiveAccountStakings.mockResolvedValueOnce(
+      makeStakingsResponse([{ bookNFT: CHECKSUMMED, staked: '1000', pending: '500' }]),
+    )
+    await store.fetchUserStakingData(WALLET)
+
+    mockFetchCollectiveAccountStakings.mockResolvedValueOnce(
+      makeStakingsResponse([{ bookNFT: CHECKSUMMED, staked: '1000', pending: '0' }]),
+    )
+    await store.fetchUserStakingData(WALLET)
+
+    expect(mockFetchCollectiveAccountStakings).toHaveBeenCalledTimes(2)
+    expect(store.getUserStakingData(WALLET).totalUnclaimedRewards).toBe(0n)
+  })
+
+  it('does not leave a logged-out walk joinable', async () => {
+    let resolvePage: (value: unknown) => void = () => {}
+    mockFetchCollectiveAccountStakings.mockReturnValueOnce(
+      new Promise((resolve) => {
+        resolvePage = resolve
+      }),
+    )
+
+    const abandoned = store.fetchUserStakingData(WALLET)
+    // Logging out is the only trigger for the store's reset.
+    hasLoggedIn.value = false
+    await nextTick()
+
+    // Signing back in while the abandoned walk is still paging must start a
+    // fresh one, not join a walk whose entry was cleared out from under it.
+    hasLoggedIn.value = true
+    mockFetchCollectiveAccountStakings.mockResolvedValueOnce(
+      makeStakingsResponse([{ bookNFT: CHECKSUMMED, staked: '1000', pending: '250' }]),
+    )
+    await store.fetchUserStakingData(WALLET)
+
+    expect(mockFetchCollectiveAccountStakings).toHaveBeenCalledTimes(2)
+    expect(store.getUserStakingData(WALLET).totalUnclaimedRewards).toBe(250n)
+
+    // And when the abandoned walk finally lands it must not clobber the new row.
+    resolvePage(makeStakingsResponse([{ bookNFT: CHECKSUMMED, staked: '1000', pending: '500' }]))
+    await abandoned
+
+    expect(store.getUserStakingData(WALLET).totalUnclaimedRewards).toBe(250n)
   })
 
   it('updates the existing row when a per-book refresh uses checksummed casing', async () => {
